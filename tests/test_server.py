@@ -295,6 +295,27 @@ class Safety(Base):
         with open(AUDIT) as f:
             self.assertEqual(len(f.readlines()), n)
 
+    def test_deletes_are_recoverable_from_the_audit_log(self):
+        rid = self.create(title="gone soon", notes="long note " * 100, due="2030-07-08 18:00", recurrence="monthly")
+        self.ok("reminders_delete", id=rid, confirm=True)
+        with open(AUDIT) as f:
+            snap = json.loads(f.readlines()[-1])["changes"][0]["deleted_reminder"]
+        self.assertEqual((snap["title"], snap["notes"], snap["due"], snap["recurrence"]),
+                         ("gone soon", "long note " * 100, "2030-07-08 18:00", "monthly"))
+
+        doomed = f"eventkit-mcp-test-{TAG}-doomed"
+        c = Client(env={"REMINDERS_MCP_WRITE": "1", "REMINDERS_MCP_AUDIT_LOG": AUDIT, "REMINDERS_MCP_WRITABLE_LISTS": doomed})
+        try:
+            self.assertFalse(c.call("reminders_create_list", title=doomed)[1])
+            self.assertFalse(c.call("reminders_create", list=doomed, title="inside doomed")[1])
+            self.assertFalse(c.call("reminders_delete_list", list=doomed, confirm=True, force=True)[1])
+        finally:
+            c.call("reminders_delete_list", list=doomed, confirm=True, force=True)
+            c.close()
+        with open(AUDIT) as f:
+            entry = json.loads(f.readlines()[-1])["changes"][0]
+        self.assertEqual([r["title"] for r in entry["deleted_reminders"]], ["inside doomed"])
+
     def test_list_lifecycle(self):
         self.ok("reminders_rename_list", list=B, new_title=RENAMED)
         self.create(title="inside", list=RENAMED)

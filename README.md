@@ -38,7 +38,7 @@ Every result carries **stable EventKit ids**, so writes target exactly one remin
 2. **`REMINDERS_MCP_WRITABLE_LISTS`** (optional) limits writes to named lists. A move into, or out of, any other list is refused.
 3. **Batches are dry runs unless you pass `dry_run: false`.** The plan shows every change as `from → to` for each item. If any operation is invalid, **none** are applied: all changes are saved in a single commit, and a failed save is rolled back.
 4. **Destructive actions need `confirm: true`**, and batches refuse deletes unless `allow_destructive` is also true. Destructive tools have `delete` in their names and carry MCP `destructiveHint` annotations, so a client's permission hooks can classify them by name.
-5. **Every applied write is appended to an audit log**: time, tool, ids, and each field's before → after. The file is `~/.local/state/eventkit-reminders-mcp/audit.log`, mode `0600`, or set your own with `REMINDERS_MCP_AUDIT_LOG`. Dry runs aren't logged because they change nothing.
+5. **Every applied write is appended to an audit log**: time, tool, ids, and each field's before → after. **Deletes record the whole reminder** (notes, due date, repeat, URL), and a forced `delete_list` records every reminder it removed, so anything deleted can be recreated by hand. The file is `~/.local/state/eventkit-reminders-mcp/audit.log`, mode `0600`, or set your own with `REMINDERS_MCP_AUDIT_LOG`. Dry runs aren't logged because they change nothing. The log holds your reminder text in plain text, so treat it like the Reminders data itself.
 6. **No network access.** The source contains no networking code, and a test checks the compiled binary imports no networking APIs (`URLSession`, sockets, `Network.framework`…).
 
 ## Design and threat model
@@ -81,7 +81,9 @@ Every result carries **stable EventKit ids**, so writes target exactly one remin
 ```
 
 Dates are local time: `"YYYY-MM-DD"` for all-day, `"YYYY-MM-DD HH:MM"` for timed. A timed due
-date gets an alert at that time unless you pass `alarm: false`.
+date gets an alert at that time unless you pass `alarm: false`. Rescheduling replaces only
+fixed-time alerts. Alerts set relative to the due date move with it, and location alerts
+("when I get home") are never touched.
 
 ## Install
 
@@ -132,6 +134,13 @@ for Claude Desktop. Not the binary itself.
 - **Completing a repeating reminder** advances it to its next occurrence, as in the app.
   Deleting it removes the whole series.
 - **New lists go into the default account** (usually iCloud).
+- **The writable-lists allowlist matches titles or ids.** If two accounts have a list with the
+  same allowed title, both are writable. Use list ids for a strict allowlist.
+- **A dry run is a preview, not a lock.** Applying re-checks everything against the reminders
+  as they are *then*. If something changed in between (on your phone, say), the applied result
+  reflects the new state, and the response shows exactly what changed.
+- **There's no undo tool.** The audit log has what you need to reverse a change by hand.
+- **Editing a shared list changes it for everyone** it's shared with, as in the app.
 - A list name shared by two accounts is ambiguous by title. Pass its id from `reminders_list_lists`.
 
 ## Tests

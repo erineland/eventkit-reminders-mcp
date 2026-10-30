@@ -58,6 +58,7 @@ final class Planned {
     var error: String?, note: String?
     var apply: (() throws -> Void)?
     var touched: EKReminder?   // after apply: the saved reminder, for reporting its (new) id
+    var snapshot: [String: Any]?   // a deleted reminder in full, so the audit log can recreate it
 
     init(_ index: Int, _ op: String) { self.index = index; self.op = op }
 
@@ -173,6 +174,7 @@ final class Engine {
         guard try a.bool("confirm") == true else { throw ToolError("Deleting needs 'confirm': true.") }
         if r.hasRecurrenceRules { p.note = "Repeating reminder: deleting removes the whole series." }
         p.changes = [("deleted", false, true)]
+        p.snapshot = describe(r, notesChars: Int.max)
         p.apply = { [ek] in try ek.remove(r, commit: false) }
     }
 
@@ -221,11 +223,14 @@ final class Engine {
                 let shown = allDay ? s.prefix(10).description : When.minute.string(from: Calendar.current.date(from: dc)!)
                 change("due", jv(r.flatMap { When.dueString($0) }), shown) { rem in
                     rem.dueDateComponents = dc
-                    // Rescheduling replaces the alerts: one at the new time unless alarm is false.
-                    rem.alarms?.forEach { rem.removeAlarm($0) }
+                    // Only the fixed-time alerts belong to the old due time, so only they are replaced. Alerts
+                    // relative to the due date move with it, and location alerts ("when I get home") are kept.
+                    let alarms = rem.alarms ?? []
+                    alarms.filter { $0.absoluteDate != nil }.forEach { rem.removeAlarm($0) }
+                    let hasRelative = alarms.contains { $0.absoluteDate == nil && $0.structuredLocation == nil }
                     if !allDay {
                         rem.timeZone = .current   // the components' own zone is dropped on save; the item's sticks
-                        if alarm, let at = Calendar.current.date(from: dc) { rem.addAlarm(EKAlarm(absoluteDate: at)) }
+                        if alarm, !hasRelative, let at = Calendar.current.date(from: dc) { rem.addAlarm(EKAlarm(absoluteDate: at)) }
                     } else {
                         rem.timeZone = nil
                     }
@@ -234,7 +239,8 @@ final class Engine {
                 dueAfter = false
                 change("due", jv(r.flatMap { When.dueString($0) }), NSNull()) { rem in
                     rem.dueDateComponents = nil
-                    rem.alarms?.forEach { rem.removeAlarm($0) }
+                    // Time alerts mean nothing without a due date; location alerts still do.
+                    rem.alarms?.filter { $0.structuredLocation == nil }.forEach { rem.removeAlarm($0) }
                 }
             }
         }
@@ -311,7 +317,11 @@ final class Engine {
         }
         out["operations"] = plans.map { $0.json() }
         out["result"] = "Applied \(todo.count) change(s)."
-        if let warn = Audit.write(cfg.auditPath, tool: tool, entries: todo.map { $0.json() }) { out["audit_warning"] = warn }
+        if let warn = Audit.write(cfg.auditPath, tool: tool, entries: todo.map { p in
+            var e = p.json()
+            if let s = p.snapshot { e["deleted_reminder"] = s }
+            return e
+        }) { out["audit_warning"] = warn }
         return out
     }
 }

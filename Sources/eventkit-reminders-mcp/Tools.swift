@@ -277,11 +277,14 @@ func makeTools(_ rem: Reminders, _ engine: Engine) -> [Tool] {
             let c = try rem.list(try a.req("list"))
             try engine.checkWritable(c)
             guard try a.bool("confirm") == true else { throw ToolError("Deleting a list needs 'confirm': true.") }
-            let inside = rem.fetch([c], status: .all).count
-            if inside > 0, try a.bool("force") != true {
-                throw ToolError("'\(c.title)' still holds \(inside) reminder(s). Move them first, or pass force: true to delete them with it.")
+            let inside = rem.fetch([c], status: .all)
+            if !inside.isEmpty, try a.bool("force") != true {
+                throw ToolError("'\(c.title)' still holds \(inside.count) reminder(s). Move them first, or pass force: true to delete them with it.")
             }
-            let entry: [String: Any] = ["op": "delete_list", "id": c.calendarIdentifier, "title": c.title, "reminders_deleted": inside]
+            // The audit entry keeps every reminder in full, so a forced delete can be undone by hand.
+            let entry: [String: Any] = ["op": "delete_list", "id": c.calendarIdentifier, "title": c.title,
+                                        "reminders_deleted": inside.count,
+                                        "deleted_reminders": inside.map { describe($0, notesChars: Int.max) }]
             try rem.ek.removeCalendar(c, commit: true)
             var out: [String: Any] = ["deleted": entry]
             if let w = Audit.write(cfg.auditPath, tool: "reminders_delete_list", entries: [entry]) { out["audit_warning"] = w }
