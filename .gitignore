@@ -1,5 +1,5 @@
 .build/
 .swiftpm/
-BRIEF.md
 __pycache__/
 *.log
+BRIEF*.md

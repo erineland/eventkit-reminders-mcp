@@ -16,7 +16,7 @@ reviewed batch.
 | `reminders_list_lists` | Every list with its id, account, open and overdue counts, and whether it's writable |
 | `reminders_list` | Reminders filtered by list, open/completed, overdue, due before/after, undated, priority or text. Sorted by due date, paged |
 | `reminders_search` | Text search across every list's titles and notes |
-| `reminders_get` | Full details by id |
+| `reminders_get` | Full details by id, including each alert's type: time, relative, or location (place name and arriving/leaving; never coordinates) |
 | `reminders_stats` | Per-list health: open, overdue, undated, high priority, duplicate titles, oldest open item |
 | `reminders_find_duplicates` | Groups of same or near-same titles, within a list or across lists. `fuzzy` also catches typos |
 | **Writes** (only listed when enabled) | |
@@ -24,7 +24,7 @@ reviewed batch.
 | `reminders_update` | Change any field by id, including moving it to another list or ticking it |
 | `reminders_move` | Move to another list. **The same reminder moves:** its id, notes, due date and repeat survive |
 | `reminders_complete` / `reminders_uncomplete` | Tick or untick |
-| `reminders_batch` | Many operations in one call. **Dry run by default**, all-or-nothing |
+| `reminders_batch` | Many operations in one call. **Dry run by default**, all-or-nothing (or `atomic: false` to save one by one and name any that fail) |
 | `reminders_create_list` / `reminders_rename_list` | Lists |
 | `reminders_delete` / `reminders_delete_list` | **Destructive:** needs `confirm: true`. A list must be empty unless `force: true` |
 
@@ -84,6 +84,21 @@ Dates are local time: `"YYYY-MM-DD"` for all-day, `"YYYY-MM-DD HH:MM"` for timed
 date gets an alert at that time unless you pass `alarm: false`. Rescheduling replaces only
 fixed-time alerts. Alerts set relative to the due date move with it, and location alerts
 ("when I get home") are never touched.
+
+## Lists shared with you
+
+A list someone else shared with you lives in **their** iCloud. Apple's API can't move a
+reminder between two people's iCloud, so a move into such a list fails. The server then says
+so plainly, rather than returning Reminders' bare error code (-3002, or -3004 in a batch).
+EventKit doesn't tell apps which lists are shared, so the server can only find out by trying.
+
+To move one there anyway, use `reminders_batch` with `"via": "copy"` and `confirm: true` on
+the operation, plus `allow_destructive: true`. The reminder is re-created in that list and the
+original deleted, both in the same all-or-nothing save. It gets a **new id**, returned as
+`new_id`. The copy keeps the title, notes, URL, priority, due date, repeat, alerts (location
+alerts included) and completion. It loses anything EventKit can't see: flags, subtasks, tags,
+images, sections and the original created date. The audit log keeps the whole original. Because
+it deletes, `via: "copy"` works only in `reminders_batch`, never in the single-item tools.
 
 ## Install
 

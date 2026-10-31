@@ -23,6 +23,14 @@ A = f"eventkit-mcp-test-{TAG}-a"
 B = f"eventkit-mcp-test-{TAG}-b"
 RENAMED = f"eventkit-mcp-test-{TAG}-renamed"
 TMP = tempfile.mkdtemp(prefix="eventkit-mcp-test-")
+FIXTURE = os.path.join(TMP, "add_location_alarm")
+
+
+def add_location_alarm(rid):
+    if not os.path.exists(FIXTURE):
+        subprocess.run(["swiftc", "-O", os.path.join(ROOT, "tests", "fixtures", "add_location_alarm.swift"), "-o", FIXTURE],
+                       check=True, capture_output=True)
+    subprocess.run([FIXTURE, rid], check=True, capture_output=True)
 AUDIT = os.path.join(TMP, "audit.log")
 
 
@@ -173,7 +181,8 @@ class Writes(Base):
                           due="2030-05-06 07:30", recurrence="weekly", recurrence_interval=2)
         r = self.get(rid)
         self.assertEqual((r["title"], r["notes"], r["url"], r["priority"], r["due"], r["recurrence"], r["alarms"]),
-                         ("round trip", "n", "https://example.com/x", "medium", "2030-05-06 07:30", "every 2 weeks", 1))
+                         ("round trip", "n", "https://example.com/x", "medium", "2030-05-06 07:30", "every 2 weeks",
+                          [{"type": "time", "at": "2030-05-06 07:30"}]))
 
     def test_all_day_and_no_alarm(self):
         r = self.get(self.create(title="all day", due="2030-01-02"))
@@ -215,6 +224,61 @@ class Writes(Base):
         out = self.ok("reminders_move", id=rid, to_list=B, dry_run=True)
         self.assertTrue(out["dry_run"])
         self.assertEqual(self.get(rid)["list"], A)
+
+
+LOCATION = {"type": "location", "place": "Test Place", "trigger": "arriving", "radius_m": 100}
+
+
+class LocationAlerts(Base):
+    def test_get_shows_location_alert(self):
+        rid = self.create(title="when I arrive")
+        add_location_alarm(rid)
+        self.assertEqual(self.get(rid)["alarms"], [LOCATION])
+
+    def test_move_and_reschedule_keep_location_alert(self):
+        rid = self.create(title="loc move", due="2030-01-01 09:00")
+        add_location_alarm(rid)
+        self.ok("reminders_move", id=rid, to_list=B)
+        self.ok("reminders_update", id=rid, due="2030-02-02 10:00")
+        alarms = self.get(rid)["alarms"]
+        self.assertIn(LOCATION, alarms)
+        self.assertIn({"type": "time", "at": "2030-02-02 10:00"}, alarms)
+        self.ok("reminders_update", id=rid, due=None)
+        self.assertEqual(self.get(rid)["alarms"], [LOCATION])
+
+    def test_move_via_copy(self):
+        rid = self.create(title="copy me", notes="keep", due="2030-04-05 08:00", recurrence="weekly", priority="high")
+        add_location_alarm(rid)
+        op = {"op": "move", "id": rid, "to_list": B, "via": "copy", "confirm": True}
+        self.assertIn("allow_destructive", self.ok("reminders_batch", dry_run=False, operations=[op])["operations"][0]["error"])
+        no_confirm = dict(op, confirm=False)
+        self.assertIn("confirm", self.ok("reminders_batch", dry_run=False, allow_destructive=True,
+                                         operations=[no_confirm])["operations"][0]["error"])
+        single = self.ok("reminders_update", id=rid, list=B, via="copy", confirm=True)   # single tools never delete
+        self.assertIn("only works in reminders_batch", single["operations"][0]["error"])
+        plan = self.ok("reminders_batch", allow_destructive=True, operations=[op])["operations"][0]
+        self.assertIn("NEW id", plan["note"])
+        self.assertEqual(self.get(rid)["list"], A)
+
+        out = self.ok("reminders_batch", dry_run=False, allow_destructive=True, operations=[op])["operations"][0]
+        new = out["new_id"]
+        self.assertNotEqual(new, rid)
+        self.assertEqual(self.ok("reminders_get", ids=[rid])["not_found"], [rid])
+        r = self.get(new)
+        self.assertEqual((r["title"], r["list"], r["notes"], r["due"], r["recurrence"], r["priority"]),
+                         ("copy me", B, "keep", "2030-04-05 08:00", "weekly", "high"))
+        self.assertIn(LOCATION, r["alarms"])
+        with open(AUDIT) as f:
+            entry = json.loads(f.readlines()[-1])["changes"][0]
+        self.assertEqual((entry["new_id"], entry["deleted_reminder"]["title"]), (new, "copy me"))
+
+    def test_non_atomic_batch(self):
+        r1, r2 = self.create(title="na1"), self.create(title="na2")
+        out = self.ok("reminders_batch", dry_run=False, atomic=False,
+                      operations=[{"op": "complete", "id": r1}, {"op": "move", "id": r2, "to_list": B}])
+        self.assertEqual(out["result"], "Applied 2 change(s).")
+        self.assertTrue(self.get(r1)["completed"])
+        self.assertEqual(self.get(r2)["list"], B)
 
 
 class Batch(Base):

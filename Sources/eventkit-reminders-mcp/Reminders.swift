@@ -177,7 +177,19 @@ func describe(_ r: EKReminder, notesChars: Int = 500) -> [String: Any] {
     ]
     if r.isCompleted, let c = r.completionDate { out["completed_at"] = When.minute.string(from: c) }
     if When.isOverdue(r) { out["overdue"] = true }
-    if let a = r.alarms, !a.isEmpty { out["alarms"] = a.count }
+    if let a = r.alarms, !a.isEmpty { out["alarms"] = a.map(describeAlarm) }
     if let c = r.creationDate { out["created"] = When.minute.string(from: c) }
     return out
+}
+
+/// Time, relative or location alert. Locations show the place name and trigger only, never coordinates.
+func describeAlarm(_ a: EKAlarm) -> [String: Any] {
+    if let loc = a.structuredLocation {
+        var o: [String: Any] = ["type": "location", "place": loc.title ?? "",
+                                "trigger": a.proximity == .leave ? "leaving" : a.proximity == .enter ? "arriving" : "none"]
+        if loc.radius > 0 { o["radius_m"] = Int(loc.radius) }
+        return o
+    }
+    if let at = a.absoluteDate { return ["type": "time", "at": When.minute.string(from: at)] }
+    return ["type": "relative", "minutes_before_due": Int(-a.relativeOffset / 60)]
 }

@@ -215,17 +215,22 @@ func makeTools(_ rem: Reminders, _ engine: Engine) -> [Tool] {
                 from → to) and writes nothing until you pass dry_run: false. All-or-nothing: if any operation is \
                 invalid, nothing is applied. Each op is {"op": "create"|"update"|"move"|"complete"|"uncomplete"|"delete", ...} \
                 with the same fields as the single tools (move takes 'to_list'). One operation per reminder; \
-                deletes are refused unless allow_destructive is true and the op has confirm: true.
+                deletes are refused unless allow_destructive is true and the op has confirm: true. \
+                A move into a list someone else shared with you can't be a true move (it's another person's iCloud): \
+                give that op "via": "copy" and confirm: true (plus allow_destructive) to re-create it there with a new id \
+                and delete the original.
                 """,
              properties: [
                 "operations": ["type": "array", "items": ["type": "object"], "description": "Up to 500 operations."],
                 "dry_run": prop("boolean", "Default TRUE: plan only. Pass false to apply."),
-                "allow_destructive": prop("boolean", "Allow delete ops. Default false."),
+                "allow_destructive": prop("boolean", "Allow delete ops and via: \"copy\" moves. Default false."),
+                "atomic": prop("boolean", "Default true: all or nothing in one save. false: save each operation on its own, skip and name any that fail."),
              ],
              required: ["operations"], write: true, destructive: true) { a in
             guard let ops = a.d["operations"] as? [Any] else { throw ToolError("'operations' must be a list.") }
             return try engine.run(ops, dryRun: try a.bool("dry_run") ?? true,
-                                  allowDestructive: try a.bool("allow_destructive") ?? false, tool: "reminders_batch")
+                                  allowDestructive: try a.bool("allow_destructive") ?? false, tool: "reminders_batch",
+                                  atomic: try a.bool("atomic") ?? true)
         },
         Tool(name: "reminders_create_list",
              description: "Create a new list in the default account.",

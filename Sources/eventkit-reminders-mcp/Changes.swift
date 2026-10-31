@@ -56,6 +56,8 @@ final class Planned {
     var id: String?, title: String?, list: String?
     var changes: [(field: String, from: Any, to: Any)] = []
     var error: String?, note: String?
+    var newId: String?   // set when the reminder had to be re-created (via: "copy")
+    var raw: Any = NSNull()   // the operation as given, to re-plan it in a non-atomic batch
     var apply: (() throws -> Void)?
     var touched: EKReminder?   // after apply: the saved reminder, for reporting its (new) id
     var snapshot: [String: Any]?   // a deleted reminder in full, so the audit log can recreate it
@@ -74,6 +76,7 @@ final class Planned {
         }
         if let error { o["error"] = error }
         if let note { o["note"] = note }
+        if let newId { o["new_id"] = newId }
         return o
     }
 }
@@ -101,13 +104,16 @@ final class Engine {
         let a = Args(d: d)
         let op = ((try? a.str("op")) ?? nil)?.lowercased() ?? "?"
         let p = Planned(index, op)
+        p.raw = raw
         do {
             switch op {
             case "create": try planCreate(a, p)
-            case "update": try planUpdate(a, p)
+            case "update": try planUpdate(a, p, allowDestructive: allowDestructive)
             case "move":
                 guard a.has("to_list") || a.has("list") else { throw ToolError("'to_list' is required.") }
-                try planUpdate(Args(d: ["id": d["id"] ?? NSNull(), "list": d["to_list"] ?? d["list"]!]), p)
+                try planUpdate(Args(d: ["id": d["id"] ?? NSNull(), "list": d["to_list"] ?? d["list"]!,
+                                        "via": d["via"] ?? NSNull(), "confirm": d["confirm"] ?? NSNull()]), p,
+                               allowDestructive: allowDestructive)
             case "complete", "uncomplete":
                 try planUpdate(Args(d: ["id": d["id"] ?? NSNull(), "completed": op == "complete"]), p)
             case "delete": try planDelete(a, p, allowDestructive: allowDestructive)
@@ -138,7 +144,7 @@ final class Engine {
         }
     }
 
-    private func planUpdate(_ a: Args, _ p: Planned) throws {
+    private func planUpdate(_ a: Args, _ p: Planned, allowDestructive: Bool = false) throws {
         let id = try a.req("id")
         p.id = id
         let r = try rem.reminder(id)
@@ -154,8 +160,32 @@ final class Engine {
                 steps.append { $0.calendar = dest }
             }
         }
+        let via = (try a.str("via") ?? "move").lowercased()
+        guard via == "move" || via == "copy" else { throw ToolError("'via' must be move or copy.") }
         if changes.isEmpty { p.note = "Nothing to change."; return }
         p.changes = changes
+
+        if via == "copy" {
+            // A list someone else shared with you lives in their iCloud, and EventKit can't move a reminder
+            // between two people's iCloud. So re-create it there and delete the original, in one commit.
+            guard changes.contains(where: { $0.field == "list" }) else { throw ToolError("via: \"copy\" is only for changing list.") }
+            guard allowDestructive else {
+                throw ToolError("via: \"copy\" deletes the original, so it only works in reminders_batch with 'allow_destructive': true.")
+            }
+            guard try a.bool("confirm") == true else { throw ToolError("via: \"copy\" deletes the original, so it needs 'confirm': true.") }
+            p.note = "Re-created in the new list with a NEW id, and the original deleted. Copied: title, notes, URL, priority, "
+                + "due date, repeat, alerts (location too), completion. Not copied (EventKit can't see them): flags, subtasks, "
+                + "tags, images, sections. The created date resets."
+            p.snapshot = describe(r, notesChars: Int.max)
+            p.apply = { [ek] in
+                let n = copyReminder(r, into: ek)
+                for s in steps { s(n) }
+                try ek.save(n, commit: false)
+                try ek.remove(r, commit: false)
+                p.touched = n
+            }
+            return
+        }
         p.apply = { [ek] in
             for s in steps { s(r) }
             try ek.save(r, commit: false)
@@ -270,7 +300,7 @@ final class Engine {
 
     // MARK: run
 
-    func run(_ ops: [Any], dryRun: Bool, allowDestructive: Bool, tool: String) throws -> [String: Any] {
+    func run(_ ops: [Any], dryRun: Bool, allowDestructive: Bool, tool: String, atomic: Bool = true) throws -> [String: Any] {
         guard cfg.writes else { throw ToolError("Writes are disabled (read-only mode). Start the server with REMINDERS_MCP_WRITE=1 to allow changes.") }
         guard !ops.isEmpty else { throw ToolError("No operations given.") }
         guard ops.count <= 500 else { throw ToolError("At most 500 operations per batch.") }
@@ -300,26 +330,61 @@ final class Engine {
             return out
         }
 
-        do {
-            for p in todo { try p.apply?() }
-            try ek.commit()
-        } catch {
-            ek.reset()
-            throw ToolError("Saving failed, nothing was committed: \(error.localizedDescription)")
+        var applied = todo
+        if atomic {
+            var current: Planned?
+            do {
+                for p in todo { current = p; try p.apply?() }
+                current = nil
+                try ek.commit()
+            } catch {
+                ek.reset()
+                // A failing save names its operation; a failing commit can't, so point at the likely ones.
+                if let p = current {
+                    p.error = explain(error, moving: p.changes.contains { $0.field == "list" })
+                    out["operations"] = plans.map { $0.json() }
+                    out["result"] = "Refused: operation \(p.index) failed to save (see 'error'). Nothing was changed."
+                    return out
+                }
+                let moves = todo.filter { p in p.changes.contains { $0.field == "list" } && p.snapshot == nil }
+                throw ToolError("Saving failed, nothing was committed. " + explain(error, moving: !moves.isEmpty)
+                    + (moves.isEmpty ? "" : " Moves in this batch: operations \(moves.map { String($0.index) }.joined(separator: ", ")).")
+                    + " Run again with atomic: false to save one operation at a time and see exactly which fails.")
+            }
+        } else {
+            // One commit per operation, each re-planned against the store as it now is; failures are named and skipped.
+            applied = []
+            for p in todo {
+                let fresh = plan(p.raw, index: p.index, allowDestructive: allowDestructive)
+                do {
+                    if let e = fresh.error { throw ToolError(e) }
+                    try fresh.apply?()
+                    try ek.commit()
+                    p.touched = fresh.touched
+                    p.snapshot = fresh.snapshot
+                    applied.append(p)
+                } catch {
+                    ek.reset()
+                    p.error = (error as? ToolError)?.description ?? explain(error, moving: p.changes.contains { $0.field == "list" })
+                }
+            }
         }
 
         // Report ids as they are after the save (a new reminder only has one now).
-        for p in todo {
+        for p in applied {
             if let r = p.touched {
                 let now = r.calendarItemIdentifier
-                if p.id == nil { p.id = now } else if p.id != now { p.note = "id changed on save; new id \(now)"; p.id = now }
+                if p.id == nil { p.id = now } else if p.id != now { p.newId = now }
             }
         }
         out["operations"] = plans.map { $0.json() }
-        out["result"] = "Applied \(todo.count) change(s)."
-        if let warn = Audit.write(cfg.auditPath, tool: tool, entries: todo.map { p in
+        let failed = todo.count - applied.count
+        out["result"] = failed == 0 ? "Applied \(applied.count) change(s)."
+            : "Applied \(applied.count) change(s); \(failed) failed and were skipped (see 'error')."
+        if !applied.isEmpty, let warn = Audit.write(cfg.auditPath, tool: tool, entries: applied.map { p in
             var e = p.json()
             if let s = p.snapshot { e["deleted_reminder"] = s }
+            e.removeValue(forKey: "error")
             return e
         }) { out["audit_warning"] = warn }
         return out
@@ -347,4 +412,47 @@ enum Audit {
             return "Change saved, but the audit log couldn't be written: \(error.localizedDescription)"
         }
     }
+}
+
+/// Turns EventKit's opaque save errors into something a person (or model) can act on.
+func explain(_ error: Error, moving: Bool) -> String {
+    let e = error as NSError
+    let code = e.domain.contains("reminderkit") ? "Reminders error \(e.code)" : "\(e.domain) \(e.code)"
+    guard moving, e.domain.contains("reminderkit") else { return "Saving failed (\(code)): \(e.localizedDescription)" }
+    return "Reminders refused to move it (\(code)). The usual cause is a destination list that someone else shared "
+        + "with you: it lives in their iCloud, and Apple's API can't move a reminder between two people's iCloud. "
+        + "To re-create it there (alerts included) and delete the original, use reminders_batch with "
+        + "{\"op\": \"move\", \"id\": …, \"to_list\": …, \"via\": \"copy\", \"confirm\": true} and allow_destructive: true."
+}
+
+/// A new reminder with every field EventKit exposes copied from r (alerts re-created, not shared).
+func copyReminder(_ r: EKReminder, into ek: EKEventStore) -> EKReminder {
+    let n = EKReminder(eventStore: ek)
+    n.title = r.title
+    n.notes = r.notes
+    n.url = r.url
+    n.priority = r.priority
+    n.timeZone = r.timeZone
+    n.startDateComponents = r.startDateComponents
+    n.dueDateComponents = r.dueDateComponents
+    for rule in r.recurrenceRules ?? [] { n.addRecurrenceRule(rule.copy() as! EKRecurrenceRule) }
+    for a in r.alarms ?? [] {
+        let c: EKAlarm
+        if let l = a.structuredLocation {
+            c = EKAlarm()
+            let loc = EKStructuredLocation(title: l.title ?? "")
+            loc.geoLocation = l.geoLocation
+            loc.radius = l.radius
+            c.structuredLocation = loc
+            c.proximity = a.proximity
+        } else if let at = a.absoluteDate {
+            c = EKAlarm(absoluteDate: at)
+        } else {
+            c = EKAlarm(relativeOffset: a.relativeOffset)
+        }
+        n.addAlarm(c)
+    }
+    n.isCompleted = r.isCompleted
+    if r.isCompleted { n.completionDate = r.completionDate }
+    return n
 }
